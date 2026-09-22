@@ -51,6 +51,26 @@ ACCOUNTS_FILE = os.path.join(HERE, "accounts.txt")
 DICT_FILE = os.path.join(HERE, "filtered_words.txt")
 DICT_URL = "https://raw.githubusercontent.com/ontopcommunity/tuvungvn/main/filtered_words.txt"
 
+# ── Supabase (cloud DB) — local accounts.txt vẫn giữ ──
+SUPABASE_URL = "https://tdlubyvugaucfexezhrk.supabase.co"
+SUPABASE_KEY = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRkbHVieXZ1Z2F1Y2ZleGV6aHJrIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIs"
+    "ImlhdCI6MTc4Njc4NTcyMSwiZXhwIjoyMTAyMzYxNzIxfQ.7JkJVP9FzC51rZRwdKGL4IdY-m6ZGxyNoRE5WAGt2KU"
+)
+SB_TABLE = "noitu_accounts"
+# SQL tạo bảng (chạy 1 lần trong Supabase → SQL Editor nếu chưa có):
+# create table if not exists public.noitu_accounts (
+#   code text primary key,
+#   access_token text not null,
+#   refresh_token text not null,
+#   name text default '',
+#   level int default 1,
+#   xp int default 0,
+#   updated_at timestamptz default now(),
+#   created_at timestamptz default now()
+# );
+
 TARGET_LEVEL = 2
 MAX_PARALLEL = 10
 MAX_GAMES_PER_ACC = 100
@@ -133,9 +153,10 @@ def menu() -> None:
             f"{C.GRN}[2]{C.R}  Cày level 2 song song     (tối đa {MAX_PARALLEL} acc)",
             f"{C.GRN}[3]{C.R}  Chat spam tất cả acc      (100ms / tin, Ctrl+C dừng)",
             f"{C.GRN}[4]{C.R}  Cày + Chat (full pipeline)",
-            f"{C.GRN}[5]{C.R}  Xem danh sách account",
+            f"{C.GRN}[5]{C.R}  Xem danh sách account    (local + Supabase)",
             f"{C.GRN}[6]{C.R}  Báo cáo tổng hợp",
-            f"{C.GRN}[7]{C.R}  Xóa toàn bộ account local",
+            f"{C.GRN}[7]{C.R}  Xóa account local (+ cloud)",
+            f"{C.CYN}[8]{C.R}  Đồng bộ Supabase         (SQL setup / push / pull)",
             f"{C.YEL}[0]{C.R}  Thoát",
         ],
         C.BLU,
@@ -218,9 +239,148 @@ def robust(fn: Callable, tries: int = 5, label: str = "") -> Any:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  ACCOUNT STORE
+#  ACCOUNT STORE  (local file + Supabase)
 # ═══════════════════════════════════════════════════════════════
-def load_accounts() -> List[Dict[str, str]]:
+_acc_lock = threading.Lock()
+_sb_ok: Optional[bool] = None  # None=unknown, True=ready, False=unavailable
+
+
+def _sb_headers() -> Dict[str, str]:
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+
+def sb_check() -> bool:
+    """True nếu bảng noitu_accounts tồn tại và truy cập được."""
+    global _sb_ok
+    if _sb_ok is not None:
+        return _sb_ok
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/{SB_TABLE}",
+            params={"select": "code", "limit": "1"},
+            headers=_sb_headers(),
+            timeout=15,
+        )
+        if r.status_code == 200:
+            _sb_ok = True
+            log(f"Supabase OK → bảng {SB_TABLE}", C.GRN)
+        else:
+            _sb_ok = False
+            log(
+                f"Supabase bảng '{SB_TABLE}' chưa có (HTTP {r.status_code}). "
+                f"Chạy SQL trong README / menu [8]. Local vẫn hoạt động.",
+                C.YEL,
+            )
+    except Exception as e:
+        _sb_ok = False
+        log(f"Supabase offline: {e} — dùng local", C.YEL)
+    return _sb_ok
+
+
+def sb_fetch_all() -> List[Dict[str, str]]:
+    if not sb_check():
+        return []
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/{SB_TABLE}",
+            params={"select": "*"},
+            headers=_sb_headers(),
+            timeout=30,
+        )
+        r.raise_for_status()
+        rows = []
+        for row in r.json():
+            rows.append({
+                "code": row["code"],
+                "accessToken": row.get("access_token") or "",
+                "refreshToken": row.get("refresh_token") or "",
+                "name": row.get("name") or "",
+                "level": str(row.get("level") if row.get("level") is not None else 1),
+                "xp": str(row.get("xp") if row.get("xp") is not None else 0),
+            })
+        return rows
+    except Exception as e:
+        log(f"sb_fetch: {e}", C.YEL)
+        return []
+
+
+def sb_upsert(acc: Dict[str, str]) -> bool:
+    if not sb_check():
+        return False
+    payload = {
+        "code": acc["code"],
+        "access_token": acc["accessToken"],
+        "refresh_token": acc["refreshToken"],
+        "name": acc.get("name") or "",
+        "level": int(acc.get("level") or 1),
+        "xp": int(acc.get("xp") or 0),
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    try:
+        h = _sb_headers()
+        h["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/{SB_TABLE}",
+            params={"on_conflict": "code"},
+            headers=h,
+            json=payload,
+            timeout=20,
+        )
+        if r.status_code not in (200, 201, 204):
+            # fallback PATCH
+            r2 = requests.patch(
+                f"{SUPABASE_URL}/rest/v1/{SB_TABLE}",
+                params={"code": f"eq.{acc['code']}"},
+                headers=_sb_headers(),
+                json=payload,
+                timeout=20,
+            )
+            if r2.status_code not in (200, 204):
+                log(f"sb_upsert fail {r.status_code}/{r2.status_code}: {r.text[:120]}", C.YEL)
+                return False
+        return True
+    except Exception as e:
+        log(f"sb_upsert: {e}", C.YEL)
+        return False
+
+
+def sb_delete(code: str) -> None:
+    if not sb_check():
+        return
+    try:
+        requests.delete(
+            f"{SUPABASE_URL}/rest/v1/{SB_TABLE}",
+            params={"code": f"eq.{code}"},
+            headers=_sb_headers(),
+            timeout=15,
+        )
+    except Exception:
+        pass
+
+
+def sb_clear_all() -> None:
+    if not sb_check():
+        return
+    try:
+        requests.delete(
+            f"{SUPABASE_URL}/rest/v1/{SB_TABLE}",
+            params={"code": "neq."},  # delete all (code not equal empty - hack)
+            headers=_sb_headers(),
+            timeout=30,
+        )
+        # safer: fetch then delete each
+        for a in sb_fetch_all():
+            sb_delete(a["code"])
+    except Exception:
+        pass
+
+
+def load_local() -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     if not os.path.isfile(ACCOUNTS_FILE):
         return rows
@@ -243,7 +403,7 @@ def load_accounts() -> List[Dict[str, str]]:
     return rows
 
 
-def save_accounts(rows: List[Dict[str, str]]) -> None:
+def save_local(rows: List[Dict[str, str]]) -> None:
     with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
         f.write("# code|accessToken|refreshToken|name|level|xp\n")
         for r in rows:
@@ -253,19 +413,82 @@ def save_accounts(rows: List[Dict[str, str]]) -> None:
             )
 
 
-_acc_lock = threading.Lock()
+def _merge_accounts(local: List[Dict[str, str]], cloud: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Gộp local + Supabase, ưu tiên level/xp cao hơn, token mới hơn từ cloud nếu level bằng."""
+    by_code: Dict[str, Dict[str, str]] = {}
+    for r in local:
+        by_code[r["code"]] = dict(r)
+    for r in cloud:
+        if r["code"] not in by_code:
+            by_code[r["code"]] = dict(r)
+        else:
+            cur = by_code[r["code"]]
+            try:
+                if int(r.get("level") or 0) > int(cur.get("level") or 0):
+                    by_code[r["code"]] = dict(r)
+                elif int(r.get("level") or 0) == int(cur.get("level") or 0):
+                    if int(r.get("xp") or 0) >= int(cur.get("xp") or 0):
+                        # keep cloud tokens if fresher progress
+                        by_code[r["code"]] = {
+                            **cur,
+                            "accessToken": r.get("accessToken") or cur.get("accessToken", ""),
+                            "refreshToken": r.get("refreshToken") or cur.get("refreshToken", ""),
+                            "level": r.get("level", cur.get("level")),
+                            "xp": r.get("xp", cur.get("xp")),
+                            "name": r.get("name") or cur.get("name", ""),
+                        }
+            except ValueError:
+                pass
+    return list(by_code.values())
+
+
+def load_accounts() -> List[Dict[str, str]]:
+    """Load local + Supabase, merge, sync cả 2 chiều nhẹ."""
+    local = load_local()
+    cloud = sb_fetch_all()
+    merged = _merge_accounts(local, cloud)
+    # write-back local so file luôn đủ
+    if merged:
+        save_local(merged)
+    return merged
 
 
 def upsert_account(acc: Dict[str, str]) -> None:
+    """Lưu local VÀ Supabase (không xoá local)."""
     with _acc_lock:
-        rows = load_accounts()
+        rows = load_local()
+        found = False
         for i, r in enumerate(rows):
             if r["code"] == acc["code"]:
                 rows[i] = acc
-                save_accounts(rows)
-                return
-        rows.append(acc)
-        save_accounts(rows)
+                found = True
+                break
+        if not found:
+            rows.append(acc)
+        save_local(rows)
+    # cloud async-ish (same thread, quick)
+    sb_upsert(acc)
+
+
+def sync_local_to_cloud() -> Tuple[int, int]:
+    """Đẩy toàn bộ local → Supabase."""
+    rows = load_local()
+    ok = fail = 0
+    for r in rows:
+        if sb_upsert(r):
+            ok += 1
+        else:
+            fail += 1
+    return ok, fail
+
+
+def sync_cloud_to_local() -> int:
+    """Kéo Supabase → local (merge)."""
+    cloud = sb_fetch_all()
+    local = load_local()
+    merged = _merge_accounts(local, cloud)
+    save_local(merged)
+    return len(cloud)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -938,13 +1161,77 @@ def feature_report() -> None:
 
 
 def feature_clear() -> None:
-    ans = input(f"  {C.RED}Xóa hết accounts.txt? (yes/N): {C.R}").strip().lower()
+    ans = input(f"  {C.RED}Xóa hết local + Supabase? (yes/N): {C.R}").strip().lower()
     if ans == "yes":
+        rows = load_local()
+        for r in rows:
+            sb_delete(r["code"])
         if os.path.isfile(ACCOUNTS_FILE):
             os.remove(ACCOUNTS_FILE)
-        log("Đã xóa.", C.YEL)
+        log("Đã xóa local + cloud.", C.YEL)
     else:
         log("Hủy.", C.DIM)
+
+
+SQL_CREATE = """
+-- Chạy 1 lần trong Supabase Dashboard → SQL Editor
+create table if not exists public.noitu_accounts (
+  code text primary key,
+  access_token text not null,
+  refresh_token text not null,
+  name text default '',
+  level int default 1,
+  xp int default 0,
+  updated_at timestamptz default now(),
+  created_at timestamptz default now()
+);
+
+alter table public.noitu_accounts enable row level security;
+
+-- service_role bỏ qua RLS; anon chỉ đọc nếu cần:
+drop policy if exists "allow_service" on public.noitu_accounts;
+create policy "allow_all_service" on public.noitu_accounts
+  for all using (true) with check (true);
+"""
+
+
+def feature_supabase() -> None:
+    box(
+        "SUPABASE",
+        [
+            f"URL: {SUPABASE_URL}",
+            f"Table: {SB_TABLE}",
+            f"{C.GRN}[a]{C.R} In SQL tạo bảng (copy)",
+            f"{C.GRN}[b]{C.R} Kiểm tra kết nối",
+            f"{C.GRN}[c]{C.R} Push local → cloud",
+            f"{C.GRN}[d]{C.R} Pull cloud → local",
+            f"{C.YEL}[x]{C.R} Quay lại",
+        ],
+        C.CYN,
+    )
+    sub = input(f"  {C.BOLD}Chọn{C.R} › ").strip().lower()
+    if sub == "a":
+        print("\n" + C.YEL + SQL_CREATE + C.R)
+        log("Copy SQL trên → Supabase Dashboard → SQL Editor → Run", C.CYN)
+    elif sub == "b":
+        global _sb_ok
+        _sb_ok = None
+        if sb_check():
+            n = len(sb_fetch_all())
+            box("SUPABASE OK", [f"Bảng tồn tại", f"Số acc trên cloud: {C.GRN}{n}{C.R}"], C.GRN)
+        else:
+            box("SUPABASE LỖI", ["Chưa có bảng hoặc sai key", "Chọn [a] để lấy SQL tạo bảng"], C.RED)
+    elif sub == "c":
+        if not sb_check():
+            log("Cloud chưa sẵn sàng. Tạo bảng trước ([a]).", C.RED)
+            return
+        ok, fail = sync_local_to_cloud()
+        box("PUSH XONG", [f"OK: {ok}", f"Fail: {fail}"], C.GRN)
+    elif sub == "d":
+        n = sync_cloud_to_local()
+        box("PULL XONG", [f"Cloud rows: {n}", f"Đã merge vào {ACCOUNTS_FILE}"], C.GRN)
+    else:
+        log("Quay lại menu.", C.DIM)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -952,9 +1239,9 @@ def feature_clear() -> None:
 # ═══════════════════════════════════════════════════════════════
 def main() -> None:
     if sys.platform != "win32":
-        # enable ANSI on most terminals
         pass
     banner()
+    sb_check()  # probe cloud (local vẫn dùng nếu fail)
     while True:
         menu()
         choice = input(f"  {C.BOLD}Chọn{C.R} › ").strip()
@@ -973,6 +1260,8 @@ def main() -> None:
             feature_report()
         elif choice == "7":
             feature_clear()
+        elif choice == "8":
+            feature_supabase()
         elif choice == "0":
             log("Bye!", C.CYN)
             break

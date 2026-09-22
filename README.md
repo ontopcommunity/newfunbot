@@ -1,46 +1,38 @@
-# newfunbot — noitu.fun all-in-one
+# newfunbot — noitu.fun all-in-one + Supabase
 
-Một file duy nhất: **`noitubot.py`**
+File chính: **`noitubot.py`**
 
-## Chức năng
+## Lưu trữ account
 
-1. **Tạo account** guest (lưu `accounts.txt`)
-2. **Cày level 2** song song tối đa **10 acc**
-3. **Chat spam** — nhập nội dung, tất cả acc nhắn mỗi **100ms**, Ctrl+C dừng
-4. **Báo cáo** sau mỗi lần chạy
-5. Menu chọn số, terminal có màu + khung
+| Nơi | Mô tả |
+|-----|--------|
+| **Local** `accounts.txt` | Luôn giữ, không xoá |
+| **Supabase** `noitu_accounts` | Đồng bộ cloud |
 
-## Cài đặt
+### Setup Supabase (1 lần)
 
-```bash
-pip install requests websocket-client
-```
-
-(File `filtered_words.txt` cùng thư mục — nếu thiếu bot tự tải từ GitHub)
+1. Mở [SQL Editor](https://supabase.com/dashboard/project/tdlubyvugaucfexezhrk/sql)
+2. Chạy file `setup_supabase.sql` (hoặc menu bot **[8] → [a]**)
+3. Menu **[8] → [b]** kiểm tra kết nối
+4. **[8] → [c]** push local → cloud
 
 ## Chạy
 
 ```bash
+pip install requests websocket-client
 python noitubot.py
 ```
 
 ```
 [1] Tạo account mới
-[2] Cày level 2 song song
-[3] Chat spam tất cả acc
-[4] Cày + Chat (full)
-[5] Xem danh sách account
-[6] Báo cáo tổng hợp
-[7] Xóa account local
+[2] Cày level 2 song song (≤10)
+[3] Chat spam 100ms (Ctrl+C dừng)
+[4] Full pipeline
+[5] Xem danh sách (local + cloud merge)
+[6] Báo cáo
+[7] Xóa local + cloud
+[8] Đồng bộ Supabase
 [0] Thoát
 ```
 
-## File accounts.txt
-
-```
-code|accessToken|refreshToken|name|level|xp
-```
-
-## Logic nối từ
-
-Dựa trên cách chọn từ của `tool.js` (repo tuvungvn): index theo âm tiết đầu, thử lần lượt ứng viên hợp lệ khi trả lời solo `word-link/answer`.
+Mỗi lần tạo / cập nhật level·xp → ghi **local + Supabase**.
