@@ -110,7 +110,7 @@ def log(msg: str, color: str = C.WHT) -> None:
 
 
 def attach_tty() -> None:
-    """Khi chạy curl|python, stdin là pipe → gắn lại /dev/tty để safe_input() hoạt động."""
+    """Khi chạy curl|python, stdin là pipe → gắn lại /dev/tty để input() hoạt động."""
     try:
         if not sys.stdin.isatty():
             sys.stdin = open("/dev/tty", "r")
@@ -118,9 +118,9 @@ def attach_tty() -> None:
         pass
 
 
-def safe_safe_input(prompt: str = "") -> str:
+def safe_input(prompt: str = "") -> str:
     try:
-        return safe_input(prompt)
+        return input(prompt)
     except EOFError:
         log("Không đọc được bàn phím (EOF). Chạy lại bằng:", C.RED)
         log("  curl -sL ... -o /tmp/noitubot.py && python3 /tmp/noitubot.py", C.YEL)
