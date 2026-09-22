@@ -46,7 +46,10 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
-HERE = os.path.dirname(os.path.abspath(__file__))
+try:
+    HERE = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    HERE = os.getcwd()  # chạy qua curl | python
 ACCOUNTS_FILE = os.path.join(HERE, "accounts.txt")
 DICT_FILE = os.path.join(HERE, "filtered_words.txt")
 DICT_URL = "https://raw.githubusercontent.com/ontopcommunity/tuvungvn/main/filtered_words.txt"
