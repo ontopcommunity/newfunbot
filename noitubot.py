@@ -250,6 +250,19 @@ def robust(fn: Callable, tries: int = 5, label: str = "") -> Any:
     for i in range(tries):
         try:
             return fn()
+        except requests.exceptions.HTTPError as e:
+            last = e
+            code = getattr(getattr(e, "response", None), "status_code", "?")
+            body = ""
+            try:
+                body = (e.response.text or "")[:120]
+            except Exception:
+                pass
+            log(f"  net {label} HTTP {code} {body!r} retry {delay:.0f}s ({i+1}/{tries})", C.DIM)
+            if code in (400, 401, 403, 404):
+                break  # không retry lỗi logic
+            time.sleep(delay)
+            delay = min(delay * 1.6, 18)
         except (requests.exceptions.RequestException, OSError) as e:
             last = e
             log(f"  net {label} {type(e).__name__} retry {delay:.0f}s ({i+1}/{tries})", C.DIM)
@@ -603,7 +616,7 @@ def solo_start(token: str) -> Tuple[str, Dict]:
     return sid, robust(_do, label="start")
 
 
-def solo_answer(token: str, sid: str, answer: str) -> Dict:
+def solo_answer(token: str, sid: str, answer: str, tries: int = 3) -> Dict:
     def _do():
         r = requests.post(
             f"{BASE}/word-link/answer",
@@ -614,7 +627,7 @@ def solo_answer(token: str, sid: str, answer: str) -> Dict:
         r.raise_for_status()
         return r.json()
 
-    return robust(_do, label="answer")
+    return robust(_do, tries=tries, label="answer")
 
 
 def solo_skip(token: str, sid: str) -> Dict:
@@ -678,11 +691,12 @@ def play_solo(token: str, code: str, wdict: WordDict, max_turns: int = 45) -> Di
             continue
 
         answered = False
-        for ans in cands[:8]:
+        for ans in cands[:5]:
             used.add(ans)
             try:
-                data = solo_answer(token, sid, ans)
-            except Exception:
+                data = solo_answer(token, sid, ans, tries=2)
+            except Exception as e:
+                log(f"    answer fail {ans!r}: {type(e).__name__}", C.DIM)
                 continue
             if data.get("isSuccessful"):
                 score = data.get("score", score)
