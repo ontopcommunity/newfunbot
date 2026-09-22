@@ -75,7 +75,7 @@ SB_TABLE = "noitu_accounts"
 # );
 
 TARGET_LEVEL = 2
-MAX_PARALLEL = 10
+MAX_PARALLEL = 50
 MAX_GAMES_PER_ACC = 100
 CHAT_INTERVAL = 0.1  # 100ms
 STALL_BACKOFF = 35
@@ -107,6 +107,25 @@ def ts() -> str:
 def log(msg: str, color: str = C.WHT) -> None:
     with _print_lock:
         print(f"{C.DIM}[{ts()}]{C.R} {color}{msg}{C.R}", flush=True)
+
+
+def attach_tty() -> None:
+    """Khi chạy curl|python, stdin là pipe → gắn lại /dev/tty để safe_input() hoạt động."""
+    try:
+        if not sys.stdin.isatty():
+            sys.stdin = open("/dev/tty", "r")
+    except Exception:
+        pass
+
+
+def safe_safe_input(prompt: str = "") -> str:
+    try:
+        return safe_input(prompt)
+    except EOFError:
+        log("Không đọc được bàn phím (EOF). Chạy lại bằng:", C.RED)
+        log("  curl -sL ... -o /tmp/noitubot.py && python3 /tmp/noitubot.py", C.YEL)
+        raise SystemExit(1)
+
 
 
 def banner() -> None:
@@ -626,33 +645,6 @@ def solo_result(token: str, code: str, sid: str) -> Dict:
     return robust(_do, label="result")
 
 
-# Ranked helpers (optional XP path)
-def ranked_join(token: str, code: str, game: str = "WORD_LINK") -> str:
-    def _do():
-        r = requests.post(
-            f"{BASE}/ranked/queue/join",
-            params={"userCode": code, "game": game},
-            headers=_hdr(token),
-            timeout=20,
-        )
-        r.raise_for_status()
-        return r.text.strip().strip('"')
-
-    return robust(_do, label="rank/join")
-
-
-def ranked_leave(token: str, code: str) -> None:
-    try:
-        requests.post(
-            f"{BASE}/ranked/queue/leave",
-            params={"userCode": code},
-            headers=_hdr(token),
-            timeout=12,
-        )
-    except Exception:
-        pass
-
-
 # ═══════════════════════════════════════════════════════════════
 #  SOLO PLAY  (inspired by tool.js word selection)
 # ═══════════════════════════════════════════════════════════════
@@ -864,7 +856,7 @@ class StompClient:
 # ═══════════════════════════════════════════════════════════════
 def feature_create() -> None:
     try:
-        n = int(input(f"  {C.CYN}Số account cần tạo{C.R} [1]: ").strip() or "1")
+        n = int(safe_input(f"  {C.CYN}Số account cần tạo{C.R} [1]: ").strip() or "1")
     except ValueError:
         n = 1
     n = max(1, min(n, 50))
@@ -971,7 +963,7 @@ def feature_grind() -> None:
 
     print(f"\n  Có {C.GRN}{len(rows)}{C.R} account. Cày tối đa {MAX_PARALLEL} song song.")
     try:
-        n = int(input(f"  {C.CYN}Số acc cần cày{C.R} [tất cả, max {MAX_PARALLEL}]: ").strip() or str(min(len(rows), MAX_PARALLEL)))
+        n = int(safe_input(f"  {C.CYN}Số acc cần cày{C.R} [tất cả, max {MAX_PARALLEL}]: ").strip() or str(min(len(rows), MAX_PARALLEL)))
     except ValueError:
         n = min(len(rows), MAX_PARALLEL)
     n = max(1, min(n, MAX_PARALLEL, len(rows)))
@@ -1014,13 +1006,13 @@ def feature_chat_spam() -> None:
         log("Cần: pip install websocket-client", C.RED)
         return
 
-    msg = input(f"  {C.CYN}Nội dung tin nhắn{C.R}: ").strip()
+    msg = safe_input(f"  {C.CYN}Nội dung tin nhắn{C.R}: ").strip()
     if not msg:
         log("Tin nhắn trống.", C.YEL)
         return
 
     try:
-        n = int(input(f"  {C.CYN}Số acc dùng chat{C.R} [tất cả, max {MAX_PARALLEL}]: ").strip() or str(min(len(rows), MAX_PARALLEL)))
+        n = int(safe_input(f"  {C.CYN}Số acc dùng chat{C.R} [tất cả, max {MAX_PARALLEL}]: ").strip() or str(min(len(rows), MAX_PARALLEL)))
     except ValueError:
         n = min(len(rows), MAX_PARALLEL)
     n = max(1, min(n, MAX_PARALLEL, len(rows)))
@@ -1122,7 +1114,7 @@ def feature_chat_spam() -> None:
 def feature_full() -> None:
     feature_create()
     feature_grind()
-    ans = input(f"  {C.CYN}Tiếp tục chat spam? (y/N): {C.R}").strip().lower()
+    ans = safe_input(f"  {C.CYN}Tiếp tục chat spam? (y/N): {C.R}").strip().lower()
     if ans == "y":
         feature_chat_spam()
 
@@ -1164,7 +1156,7 @@ def feature_report() -> None:
 
 
 def feature_clear() -> None:
-    ans = input(f"  {C.RED}Xóa hết local + Supabase? (yes/N): {C.R}").strip().lower()
+    ans = safe_input(f"  {C.RED}Xóa hết local + Supabase? (yes/N): {C.R}").strip().lower()
     if ans == "yes":
         rows = load_local()
         for r in rows:
@@ -1212,7 +1204,7 @@ def feature_supabase() -> None:
         ],
         C.CYN,
     )
-    sub = input(f"  {C.BOLD}Chọn{C.R} › ").strip().lower()
+    sub = safe_input(f"  {C.BOLD}Chọn{C.R} › ").strip().lower()
     if sub == "a":
         print("\n" + C.YEL + SQL_CREATE + C.R)
         log("Copy SQL trên → Supabase Dashboard → SQL Editor → Run", C.CYN)
@@ -1241,13 +1233,14 @@ def feature_supabase() -> None:
 #  MAIN
 # ═══════════════════════════════════════════════════════════════
 def main() -> None:
+    attach_tty()  # fix EOF khi chạy curl | python3
     if sys.platform != "win32":
         pass
     banner()
     sb_check()  # probe cloud (local vẫn dùng nếu fail)
     while True:
         menu()
-        choice = input(f"  {C.BOLD}Chọn{C.R} › ").strip()
+        choice = safe_input(f"  {C.BOLD}Chọn{C.R} › ").strip()
         print()
         if choice == "1":
             feature_create()
