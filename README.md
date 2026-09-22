@@ -1,38 +1,38 @@
-# newfunbot — noitu.fun automation
+# newfunbot — noitu.fun all-in-one
 
-Bot Python tự động:
+Một file duy nhất: **`noitubot.py`**
 
-1. **Tạo guest account** (POST `/api/v1/user/init`) — không cần email/password
-2. **Lưu phiên** vào `accounts.txt` (code + accessToken + refreshToken)
-3. **Cày solo nối từ** đến **level 2**
-4. **Nhắn `test`** lên chat qua STOMP WebSocket
+## Chức năng
+
+1. **Tạo account** guest (lưu `accounts.txt`)
+2. **Cày level 2** song song tối đa **10 acc**
+3. **Chat spam** — nhập nội dung, tất cả acc nhắn mỗi **100ms**, Ctrl+C dừng
+4. **Báo cáo** sau mỗi lần chạy
+5. Menu chọn số, terminal có màu + khung
 
 ## Cài đặt
 
 ```bash
-pip install -r requirements.txt
+pip install requests websocket-client
 ```
 
-## Lệnh
+(File `filtered_words.txt` cùng thư mục — nếu thiếu bot tự tải từ GitHub)
+
+## Chạy
 
 ```bash
-# Tạo 3 account
-python bot.py create 3
+python noitubot.py
+```
 
-# Xem danh sách
-python bot.py list
-
-# Cày toàn bộ account đến lv2 rồi chat "test"
-python bot.py grind
-
-# Cày 1 account cụ thể
-python bot.py grind <userCode>
-
-# Chỉ gửi chat
-python bot.py chat
-
-# Full pipeline: tạo N + cày + chat
-python bot.py full 2
+```
+[1] Tạo account mới
+[2] Cày level 2 song song
+[3] Chat spam tất cả acc
+[4] Cày + Chat (full)
+[5] Xem danh sách account
+[6] Báo cáo tổng hợp
+[7] Xóa account local
+[0] Thoát
 ```
 
 ## File accounts.txt
@@ -41,27 +41,6 @@ python bot.py full 2
 code|accessToken|refreshToken|name|level|xp
 ```
 
-Token được refresh tự động khi hết hạn.
+## Logic nối từ
 
-## API chính (đã reverse)
-
-| Endpoint | Mô tả |
-|----------|--------|
-| `POST /api/v1/user/init` | Tạo guest, trả JWT |
-| `POST /api/v1/auth/refresh` | Refresh access token |
-| `GET /api/v1/user/get?code=` | Level / XP |
-| `GET /api/v1/word-link/start?sessionId=` | Bắt đầu solo |
-| `POST /api/v1/word-link/answer` | Trả lời nối từ |
-| `GET /api/v1/word-link/result` | Kết quả ván |
-| `POST /api/v1/ranked/queue/join?game=WORD_LINK` | Hàng chờ rank 1v1 |
-| STOMP `/app/chat` + `/room/chat-room` | Chat realtime |
-
-## Ghi chú
-
-- Solo mode dùng để farm XP ổn định hơn ranked (ranked cần matchmaking 2 người).
-- Level 1 → 2 cần **50 XP**. Chat có gate `CHAT_LEVEL_REQUIREMENT` nếu chưa đủ level.
-- Từ điển: `filtered_words.txt` (từ repo tuvungvn).
-
-## Repo tham khảo
-
-- https://github.com/ontopcommunity/tuvungvn (`tool.js` — bot DOM phía browser)
+Dựa trên cách chọn từ của `tool.js` (repo tuvungvn): index theo âm tiết đầu, thử lần lượt ứng viên hợp lệ khi trả lời solo `word-link/answer`.
