@@ -624,6 +624,12 @@ def solo_answer(token: str, sid: str, answer: str, tries: int = 3) -> Dict:
             headers=_hdr(token),
             timeout=25,
         )
+        # 400 Time is up / invalid → vẫn parse JSON, không raise
+        if r.status_code == 400:
+            try:
+                return r.json()
+            except Exception:
+                r.raise_for_status()
         r.raise_for_status()
         return r.json()
 
@@ -698,6 +704,12 @@ def play_solo(token: str, code: str, wdict: WordDict, max_turns: int = 45) -> Di
             except Exception as e:
                 log(f"    answer fail {ans!r}: {type(e).__name__}", C.DIM)
                 continue
+            msg = (data.get("message") or "")
+            if "Time is up" in msg or "hết giờ" in msg.lower():
+                score = data.get("score", score)
+                finished = True
+                answered = True
+                break
             if data.get("isSuccessful"):
                 score = data.get("score", score)
                 answered = True
@@ -729,7 +741,7 @@ def play_solo(token: str, code: str, wdict: WordDict, max_turns: int = 45) -> Di
                     used.add(cur)
             except Exception:
                 break
-        time.sleep(0.08 + random.random() * 0.12)
+        time.sleep(0.05 + random.random() * 0.08)
 
     try:
         result = solo_result(token, code, sid)
