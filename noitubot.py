@@ -10,17 +10,24 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
-    import requests as _requests_fallback
+    import requests as _requests_lib
 except ImportError:
-    _requests_fallback = None
+    _requests_lib = None
 try:
     from curl_cffi import requests as _cffi_requests
     _HAS_CFFI = True
 except ImportError:
     _cffi_requests = None
     _HAS_CFFI = False
-if not _HAS_CFFI and _requests_fallback is None:
+if not _HAS_CFFI and _requests_lib is None:
     print("pip install curl_cffi requests"); sys.exit(1)
+
+# exceptions: curl_cffi tương thích requests.exceptions
+try:
+    from curl_cffi.requests import exceptions as _req_exc
+except ImportError:
+    from requests import exceptions as _req_exc  # type: ignore
+
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:
@@ -30,7 +37,6 @@ try:
 except ImportError:
     websocket = None
 
-# Session dùng curl_cffi (TLS Chrome) — giảm CF fingerprint block / 429
 _cf_cookies: dict = {}
 _http_lock = threading.Lock()
 
@@ -39,18 +45,32 @@ def http_session(impersonate: str = "chrome131"):
     if _HAS_CFFI:
         s = _cffi_requests.Session(impersonate=impersonate)
     else:
-        s = _requests_fallback.Session()
+        s = _requests_lib.Session()
     with _http_lock:
         if _cf_cookies:
-            s.cookies.update(_cf_cookies)
+            try:
+                s.cookies.update(_cf_cookies)
+            except Exception:
+                for k, v in _cf_cookies.items():
+                    try:
+                        s.cookies.set(k, v)
+                    except Exception:
+                        pass
     return s
 
-# alias tương thích đoạn code cũ dùng requests.
 class _RequestsProxy:
+    """Giả requests module: .get/.post + .exceptions (fix robust())."""
+    exceptions = _req_exc
+
     def post(self, *a, **k):
         return http_session().post(*a, **k)
+
     def get(self, *a, **k):
         return http_session().get(*a, **k)
+
+    def Session(self, *a, **k):
+        return http_session()
+
 requests = _RequestsProxy()  # type: ignore
 
 BASE = "https://api.noitu.fun/api/v1"
