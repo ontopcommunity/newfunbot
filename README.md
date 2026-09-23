@@ -1,38 +1,26 @@
-# newfunbot — noitu.fun all-in-one + Supabase
+# newfunbot — Rank thật + tool.js + Playwright
 
-File chính: **`noitubot.py`**
+## Chức năng
+- **[1] Tạo acc** — không giới hạn số lượng
+- **[2] Cày RANK** `WORD_LINK` 1v1 với người thật (không 2-acc tự match)
+  - Song song tối đa **100**
+  - Acc đã **lv≥2 bị bỏ qua**
+  - Logic nối từ theo **tool.js** (âm tiết đầu + dictionary)
+  - Mode: `1=API hybrid` | `2=Playwright DOM click`
+- **[3] Chat spam** — chỉ dùng acc có sẵn
+- Local `accounts.txt` + **Supabase**
 
-## Lưu trữ account
+## Cài đặt (máy/Cloud Shell của bạn)
 
-| Nơi | Mô tả |
-|-----|--------|
-| **Local** `accounts.txt` | Luôn giữ, không xoá |
-| **Supabase** `noitu_accounts` | Đồng bộ cloud |
-
-### Setup Supabase (1 lần)
-
-1. Mở [SQL Editor](https://supabase.com/dashboard/project/tdlubyvugaucfexezhrk/sql)
-2. Chạy file `setup_supabase.sql` (hoặc menu bot **[8] → [a]**)
-3. Menu **[8] → [b]** kiểm tra kết nối
-4. **[8] → [c]** push local → cloud
+```bash
+python3 -m pip install -q requests websocket-client playwright
+python3 -m playwright install chromium
+```
 
 ## Chạy
 
 ```bash
-pip install requests websocket-client
-python noitubot.py
+python3 -m pip install -q requests websocket-client playwright && python3 -m playwright install chromium && curl -sL https://raw.githubusercontent.com/ontopcommunity/newfunbot/main/noitubot.py -o /tmp/noitubot.py && python3 /tmp/noitubot.py
 ```
 
-```
-[1] Tạo account mới
-[2] Cày level 2 song song (≤10)
-[3] Chat spam 100ms (Ctrl+C dừng)
-[4] Full pipeline
-[5] Xem danh sách (local + cloud merge)
-[6] Báo cáo
-[7] Xóa local + cloud
-[8] Đồng bộ Supabase
-[0] Thoát
-```
-
-Mỗi lần tạo / cập nhật level·xp → ghi **local + Supabase**.
+> IP datacenter có thể bị Cloudflare chặn API/web. Chạy trên IP sạch / máy cá nhân.
