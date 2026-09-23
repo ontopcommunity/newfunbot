@@ -190,6 +190,145 @@ def menu():
         f"{C.YEL}[0]{C.R}  Thoát",
     ], C.BLU)
 
+
+# ═══════════════════════════════════════════════════════════════
+#  LIVE DASHBOARD (không spam log)
+# ═══════════════════════════════════════════════════════════════
+class GrindDashboard:
+    """Bảng trạng thái cày — 1 khung / acc + tổng quan."""
+
+    def __init__(self, codes: list):
+        self._lock = threading.Lock()
+        self.rows: Dict[str, Dict[str, Any]] = {}
+        self.t0 = time.time()
+        self.finished = False
+        for c in codes:
+            self.rows[c] = {
+                "name": c[-10:],
+                "level": 1,
+                "xp": 0,
+                "need": 50,
+                "status": "chờ",
+                "detail": "",
+                "sleep": 0,
+                "games": 0,
+                "done": False,
+                "error": "",
+            }
+        self._stop_render = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def set(self, code: str, **kw) -> None:
+        with self._lock:
+            if code not in self.rows:
+                self.rows[code] = {
+                    "name": code[-10:], "level": 1, "xp": 0, "need": 50,
+                    "status": "chờ", "detail": "", "sleep": 0, "games": 0,
+                    "done": False, "error": "",
+                }
+            self.rows[code].update({k: v for k, v in kw.items() if v is not None})
+
+    def start(self) -> None:
+        self._stop_render.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_render.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        self.render(final=True)
+
+    def _loop(self) -> None:
+        while not self._stop_render.wait(0.8):
+            self.render()
+
+    def render(self, final: bool = False) -> None:
+        with self._lock:
+            items = list(self.rows.items())
+        # stats
+        total = len(items)
+        done_n = sum(1 for _, r in items if r.get("done") or int(r.get("level") or 0) >= TARGET_LEVEL)
+        err_n = sum(1 for _, r in items if r.get("error"))
+        active = sum(1 for _, r in items if not r.get("done") and not r.get("error"))
+        sleeping = sum(1 for _, r in items if (r.get("sleep") or 0) > 0)
+        elapsed = int(time.time() - self.t0)
+
+        # ANSI clear + home
+        out = ["\033[H\033[J"]  # clear screen
+        W = 72
+        out.append(f"{C.CYN}{C.BOLD}╔{'═' * (W - 2)}╗{C.R}")
+        title = "DASHBOARD CÀY RANK"
+        out.append(f"{C.CYN}{C.BOLD}║{C.R} {C.BOLD}{C.MAG}{title}{C.R}{' ' * (W - 4 - len(title))} {C.CYN}{C.BOLD}║{C.R}")
+        out.append(f"{C.CYN}{C.BOLD}╠{'═' * (W - 2)}╣{C.R}")
+
+        # summary line
+        sum_line = (
+            f"Tổng {C.WHT}{total}{C.R}  "
+            f"{C.GRN}xong {done_n}{C.R}  "
+            f"{C.CYN}đang {active}{C.R}  "
+            f"{C.YEL}sleep {sleeping}{C.R}  "
+            f"{C.RED}lỗi {err_n}{C.R}  "
+            f"{C.DIM}{elapsed}s{C.R}"
+        )
+        pad = W - 4 - len(_strip(sum_line))
+        out.append(f"{C.CYN}║{C.R} {sum_line}{' ' * max(0, pad)} {C.CYN}║{C.R}")
+        out.append(f"{C.CYN}╠{'═' * (W - 2)}╣{C.R}")
+
+        # header
+        hdr = f"{'#':>3}  {'ACC':<12} {'LV':>3} {'XP':>8}  {'TRẠNG THÁI':<14} {'CHI TIẾT'}"
+        out.append(f"{C.CYN}║{C.R} {C.DIM}{hdr}{C.R}{' ' * max(0, W - 4 - len(hdr))} {C.CYN}║{C.R}")
+        out.append(f"{C.CYN}╟{'─' * (W - 2)}╢{C.R}")
+
+        for i, (code, r) in enumerate(items, 1):
+            name = (r.get("name") or code[-10:])[:12]
+            lv = int(r.get("level") or 1)
+            xp = int(r.get("xp") or 0)
+            need = int(r.get("need") or 50)
+            st = r.get("status") or "—"
+            sleep_s = int(r.get("sleep") or 0)
+            detail = r.get("detail") or r.get("error") or ""
+            games = int(r.get("games") or 0)
+
+            if r.get("done") or lv >= TARGET_LEVEL:
+                st_col, st = C.GRN, "✓ XONG"
+            elif r.get("error"):
+                st_col, st = C.RED, "✗ LỖI"
+            elif sleep_s > 0:
+                st_col, st = C.YEL, f"sleep {sleep_s}s"
+            elif st in ("queue", "rank", "join"):
+                st_col = C.MAG
+            elif st in ("play", "trả lời", "playing"):
+                st_col = C.CYN
+            elif st in ("chờ", "idle", "start"):
+                st_col = C.DIM
+            else:
+                st_col = C.WHT
+
+            xp_s = f"{xp}/{need}"
+            det = detail[:22]
+            if games:
+                det = (det + f" g={games}")[:22]
+            line = f"{i:>3}  {name:<12} {lv:>3} {xp_s:>8}  {st_col}{st:<14}{C.R} {C.DIM}{det}{C.R}"
+            pad = W - 4 - len(_strip(line))
+            out.append(f"{C.CYN}║{C.R} {line}{' ' * max(0, pad)} {C.CYN}║{C.R}")
+
+        out.append(f"{C.CYN}╚{'═' * (W - 2)}╝{C.R}")
+        if not final:
+            out.append(f"{C.DIM}  Cập nhật mỗi 0.8s · Ctrl+C dừng{C.R}")
+        else:
+            out.append(f"{C.GRN}  — Kết thúc phiên cày —{C.R}")
+        print("\n".join(out), flush=True)
+
+
+# dashboard toàn cục cho grind
+_DASH: Optional[GrindDashboard] = None
+
+def dash_set(code: str, **kw) -> None:
+    if _DASH:
+        _DASH.set(code, **kw)
+
+
 class WordDict:
     def __init__(self):
         self.words=[]; self.by_first=defaultdict(list); self._load()
@@ -514,61 +653,99 @@ def play_tooljs_session(token, code, wdict, sid=None):
     return {"sessionId":sid,"score":score}
 
 def grind_one(acc, wdict):
-    """Rank queue thật (WORD_LINK) + chơi; fallback session tool.js nếu chưa match."""
-    code=acc["code"]; tag=code[-8:]
-    token=ensure_token(acc)
-    level,xp,need=progress(acc, token)
-    if level>=TARGET_LEVEL:
-        return {"ok":True,"level":level,"xp":xp,"games":0,"skipped":True}
-    games=0; stall=0; last_xp=xp
-    while level<TARGET_LEVEL and games<MAX_GAMES:
-        games+=1
-        ranked_leave(token, code); time.sleep(0.3)
+    """Rank queue thật (WORD_LINK) + chơi; cập nhật dashboard thay vì spam log."""
+    code = acc["code"]
+    name = (acc.get("name") or code)[:16]
+    dash_set(code, name=name, status="start", detail="token…")
+    try:
+        token = ensure_token(acc)
+        level, xp, need = progress(acc, token)
+    except Exception as e:
+        dash_set(code, status="error", error=str(e)[:40], done=False)
+        return {"ok": False, "error": str(e)}
+    dash_set(code, name=name, level=level, xp=xp, need=need)
+    if level >= TARGET_LEVEL:
+        dash_set(code, status="done", done=True, detail="đã lv đủ")
+        return {"ok": True, "level": level, "xp": xp, "games": 0, "skipped": True}
+    games = 0
+    stall = 0
+    last_xp = xp
+    while level < TARGET_LEVEL and games < MAX_GAMES:
+        games += 1
+        dash_set(code, games=games, status="join", detail=f"queue #{games}", sleep=0)
+        ranked_leave(token, code)
+        time.sleep(0.3)
         try:
-            st=ranked_join(token, code)
-            log(f"[{tag}] rank queue #{games} → {st}", C.DIM)
+            st = ranked_join(token, code)
+            dash_set(code, status="queue", detail=str(st)[:20])
         except Exception as e:
-            log(f"[{tag}] join: {e}", C.YEL); time.sleep(2); continue
-        # chờ match status
-        sid=None; t0=time.time()
-        while time.time()-t0 < MATCH_WAIT:
+            dash_set(code, status="retry", detail=f"join: {type(e).__name__}")
+            time.sleep(2)
+            continue
+        sid = None
+        t0 = time.time()
+        while time.time() - t0 < MATCH_WAIT:
+            left = int(MATCH_WAIT - (time.time() - t0))
+            dash_set(code, status="queue", detail="chờ match", sleep=left)
             try:
-                r=requests.get(f"{BASE}/ranked/queue/status",params={"userCode":code},headers=_hdr(token),timeout=12)
-                if r.status_code==200:
-                    body=r.text
+                r = requests.get(
+                    f"{BASE}/ranked/queue/status",
+                    params={"userCode": code},
+                    headers=_hdr(token),
+                    timeout=12,
+                )
+                if r.status_code == 200:
+                    body = r.text
                     try:
-                        jd=r.json() if body.startswith("{") or body.startswith("[") else {}
+                        jd = r.json() if body.startswith("{") or body.startswith("[") else {}
                     except Exception:
-                        jd={}
+                        jd = {}
                     if isinstance(jd, dict):
-                        sid=(jd.get("sessionId") or jd.get("roomId") or jd.get("matchId")
-                             or (jd.get("data") or {}).get("sessionId"))
-                    if sid: break
-                    if body and body not in ("QUEUED",'"QUEUED"',"null"):
-                        log(f"[{tag}] status {body[:100]}", C.DIM)
-            except Exception: pass
+                        sid = (
+                            jd.get("sessionId")
+                            or jd.get("roomId")
+                            or jd.get("matchId")
+                            or (jd.get("data") or {}).get("sessionId")
+                        )
+                    if sid:
+                        break
+            except Exception:
+                pass
             time.sleep(2)
         ranked_leave(token, code)
-        # chơi session ranked nếu có, không thì tool.js session (1 acc — không 2-acc)
+        dash_set(code, status="play", detail="tool.js session", sleep=0)
         try:
-            res=play_tooljs_session(token, code, wdict, sid)
-            log(f"[{tag}] played score={res.get('score')} sid={str(res.get('sessionId'))[:8]}", C.DIM)
+            res = play_tooljs_session(token, code, wdict, sid)
+            dash_set(code, detail=f"score={res.get('score', 0)}")
         except Exception as e:
-            log(f"[{tag}] play: {e}", C.YEL)
+            dash_set(code, detail=f"play:{type(e).__name__}")
         time.sleep(0.6)
-        try: level,xp,need=progress(acc, token)
+        try:
+            level, xp, need = progress(acc, token)
         except Exception:
-            try: token=ensure_token(acc); level,xp,need=progress(acc, token)
-            except Exception: continue
-        if xp<=last_xp:
-            stall+=1
-            if stall>=3:
-                log(f"[{tag}] XP stall {STALL_BACKOFF}s", C.YEL); time.sleep(STALL_BACKOFF); stall=0
+            try:
+                token = ensure_token(acc)
+                level, xp, need = progress(acc, token)
+            except Exception:
+                continue
+        dash_set(code, level=level, xp=xp, need=need, games=games)
+        if xp <= last_xp:
+            stall += 1
+            if stall >= 3:
+                dash_set(code, status="sleep", detail="XP stall", sleep=STALL_BACKOFF)
+                for left in range(STALL_BACKOFF, 0, -1):
+                    dash_set(code, sleep=left)
+                    time.sleep(1)
+                dash_set(code, sleep=0)
+                stall = 0
         else:
-            stall=0; last_xp=xp; log(f"[{tag}] lv={level} xp={xp}/{need}", C.GRN)
-    return {"ok":level>=TARGET_LEVEL,"level":level,"xp":xp,"games":games}
+            stall = 0
+            last_xp = xp
+            dash_set(code, status="cày", detail=f"lv{level} xp{xp}")
+    ok = level >= TARGET_LEVEL
+    dash_set(code, level=level, xp=xp, need=need, done=ok, status="done" if ok else "stop", sleep=0)
+    return {"ok": ok, "level": level, "xp": xp, "games": games}
 
-# Playwright path (khi user chạy local, CF cho phép)
 def grind_one_pw(acc, wdict):
     if sync_playwright is None:
         return grind_one(acc, wdict)
@@ -687,43 +864,61 @@ def feature_grind():
     except ValueError: n=suggest
     n=max(1,min(n,MAX_PARALLEL,len(need)))
     targets=need[:n]
-    box("CÀY RANK HYBRID", [
-        f"acc={n}",
-        f"rate gap={_RATE_MIN_GAP}s | join concurrency={_JOIN_SEM._value if hasattr(_JOIN_SEM,'_value') else '?'}",
-        f"proxy={'ON' if PROXY_URL else 'OFF'}",
-        f"skip lv≥{TARGET_LEVEL}",
-    ], C.MAG)
-    # Bypass CF: lấy cookie 1 lần rồi dùng chung API
     if not api_ok_probe():
-        log("API bị chặn — thử harvest CF qua Playwright...", C.YEL)
+        log("API bị chặn — thử harvest CF…", C.YEL)
         harvest_cf_cookies()
-        if not api_ok_probe():
-            log("API vẫn chặn. Chuyển Playwright-only (nếu browser vào được).", C.YEL)
-    report={}; t0=time.time()
+
+    global _DASH
+    _DASH = GrindDashboard([a["code"] for a in targets])
+    for a in targets:
+        _DASH.set(a["code"], name=(a.get("name") or a["code"])[:12],
+                  level=int(a.get("level") or 1), xp=int(a.get("xp") or 0))
+    _DASH.start()
+    report = {}
+    t0 = time.time()
+
     def worker(a):
         try:
-            # Hybrid: API rank+play trước; fail → PW
             r = grind_one(a, wdict)
             if not r.get("ok") and not r.get("skipped"):
-                r2 = grind_one_pw(a, wdict)
-                if r2.get("level", 0) >= r.get("level", 0):
-                    r = r2
+                try:
+                    r2 = grind_one_pw(a, wdict)
+                    if int(r2.get("level") or 0) >= int(r.get("level") or 0):
+                        r = r2
+                except Exception:
+                    pass
             report[a["code"]] = r
+            dash_set(
+                a["code"],
+                done=bool(r.get("ok") or r.get("skipped")),
+                level=r.get("level"),
+                xp=r.get("xp"),
+                status="done" if r.get("ok") or r.get("skipped") else "stop",
+                error=r.get("error") or "",
+            )
         except Exception as e:
-            try:
-                report[a["code"]] = grind_one_pw(a, wdict)
-            except Exception as e2:
-                report[a["code"]] = {"ok": False, "error": f"{e} | {e2}"}
-    with ThreadPoolExecutor(max_workers=min(n, 20)) as pool:
-        futs = []
-        for i, a in enumerate(targets):
-            futs.append(pool.submit(worker, a))
-            time.sleep(0.4 + random.uniform(0, 0.3))  # stagger start — chống 429
-        list(as_completed(futs))
-    ok=sum(1 for v in report.values() if v.get("ok"))
-    lines=[f"{time.time()-t0:.0f}s", f"OK lv{TARGET_LEVEL}: {ok}/{n}", ""]
-    for c,v in report.items():
-        lines.append(f"{c[-10:]} {'OK' if v.get('ok') else 'FAIL'} lv={v.get('level')} xp={v.get('xp')} g={v.get('games')}")
+            report[a["code"]] = {"ok": False, "error": str(e)}
+            dash_set(a["code"], error=str(e)[:40], status="error")
+
+    try:
+        with ThreadPoolExecutor(max_workers=min(n, 20)) as pool:
+            futs = []
+            for i, a in enumerate(targets):
+                futs.append(pool.submit(worker, a))
+                time.sleep(0.4 + random.uniform(0, 0.3))
+            list(as_completed(futs))
+    except KeyboardInterrupt:
+        log("Dừng bởi người dùng", C.YEL)
+    finally:
+        if _DASH:
+            _DASH.stop()
+            _DASH = None
+
+    ok = sum(1 for v in report.values() if v.get("ok"))
+    lines = [f"{time.time() - t0:.0f}s", f"OK lv{TARGET_LEVEL}: {C.GRN}{ok}/{n}{C.R}", ""]
+    for c, v in report.items():
+        st = f"{C.GRN}OK{C.R}" if v.get("ok") else f"{C.RED}FAIL{C.R}"
+        lines.append(f"{c[-10:]} {st} lv={v.get('level')} xp={v.get('xp')} g={v.get('games')}")
     box("BÁO CÁO", lines, C.CYN)
 
 def feature_chat():
