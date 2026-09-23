@@ -40,24 +40,26 @@ except ImportError:
 _cf_cookies: dict = {}
 _http_lock = threading.Lock()
 
-def http_session(impersonate: str = "chrome131"):
-    """HTTP client: curl_cffi Chrome TLS + proxy (nếu có) + CF cookies."""
-    kwargs = {}
-    if PROXY_URL:
-        kwargs["proxies"] = {"http": PROXY_URL, "https": PROXY_URL}
+def http_session(impersonate: str = "chrome131", proxy: Optional[str] = None):
+    """curl_cffi + proxy pool / env proxy + CF cookies."""
+    if proxy is None:
+        proxy = PROXY_POOL.next() if PROXY_POOL.enabled else None
+        if not proxy and PROXY_URL:
+            proxy = PROXY_URL.replace("http://", "").replace("https://", "")
+    px = None
+    if proxy:
+        url = proxy if proxy.startswith("http") else f"http://{proxy}"
+        px = {"http": url, "https": url}
     if _HAS_CFFI:
-        try:
-            s = _cffi_requests.Session(impersonate=impersonate, **{k: v for k, v in kwargs.items() if k != "proxies"})
-            if PROXY_URL:
-                s.proxies = {"http": PROXY_URL, "https": PROXY_URL}
-        except TypeError:
-            s = _cffi_requests.Session(impersonate=impersonate)
-            if PROXY_URL:
-                s.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+        s = _cffi_requests.Session(impersonate=impersonate)
+        if px:
+            s.proxies = px
     else:
         s = _requests_lib.Session()
-        if PROXY_URL:
-            s.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+        if px:
+            s.proxies = px
+    # stash current proxy on session for drop-on-fail
+    s._noitu_proxy = proxy  # type: ignore
     with _http_lock:
         if _cf_cookies:
             try:
@@ -70,16 +72,21 @@ def http_session(impersonate: str = "chrome131"):
                         pass
     return s
 
+
 class _RequestsProxy:
     """Giả requests module: .get/.post + throttle + .exceptions."""
     exceptions = _req_exc
 
     def post(self, *a, **k):
         _wait_rate()
+        k.setdefault("verify", False)
+        k.setdefault("timeout", k.get("timeout", 20))
         return http_session().post(*a, **k)
 
     def get(self, *a, **k):
         _wait_rate()
+        k.setdefault("verify", False)
+        k.setdefault("timeout", k.get("timeout", 20))
         return http_session().get(*a, **k)
 
     def Session(self, *a, **k):
@@ -140,6 +147,108 @@ def _mark_429(seconds: float = 20.0):
     with _RATE_LOCK:
         _429_UNTIL = max(_429_UNTIL, time.time() + seconds)
     log(f"⚠ 429 → tạm dừng toàn bot ~{seconds:.0f}s", C.YEL)
+
+
+# ── Proxy pool (ProxyScrape + GitHub lists) ───────────────────
+class ProxyPool:
+    """Lấy proxy free, health-check, xoay khi 429/403/lỗi."""
+    SOURCES = [
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    ]
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.alive: List[str] = []
+        self._i = 0
+        self._last_fetch = 0.0
+        self.enabled = True
+
+    def fetch(self, limit_check: int = 20) -> int:
+        raw: List[str] = []
+        for url in self.SOURCES:
+            try:
+                if _HAS_CFFI:
+                    r = _cffi_requests.get(url, timeout=20, impersonate="chrome120")
+                else:
+                    r = _requests_lib.get(url, timeout=20)
+                if r.status_code != 200:
+                    continue
+                for line in r.text.splitlines():
+                    line = line.strip().split()[0] if line.strip() else ""
+                    if line.count(":") == 1:
+                        host, port = line.rsplit(":", 1)
+                        if port.isdigit() and 1 <= int(port) <= 65535:
+                            raw.append(f"{host}:{port}")
+            except Exception:
+                continue
+        raw = list(dict.fromkeys(raw))
+        random.shuffle(raw)
+        alive = []
+        # parallel health check
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        cand = raw[: max(limit_check * 3, 30)]
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futs = {ex.submit(self._health, p): p for p in cand}
+            for fut in as_completed(futs):
+                p = futs[fut]
+                try:
+                    if fut.result():
+                        alive.append(p)
+                except Exception:
+                    pass
+                if len(alive) >= 10:
+                    break
+        with self._lock:
+            self.alive = alive
+            self._i = 0
+            self._last_fetch = time.time()
+        log(f"Proxy pool: {C.GRN}{len(alive)}{C.R} sống / {len(raw)} quét", C.CYN)
+        return len(alive)
+
+    def _health(self, p: str) -> bool:
+        px = {"http": f"http://{p}", "https": f"http://{p}"}
+        try:
+            if _HAS_CFFI:
+                r = _cffi_requests.get(
+                    "https://api.ipify.org",
+                    proxies=px,
+                    timeout=4,
+                    impersonate="chrome120",
+                    verify=False,
+                )
+            else:
+                r = _requests_lib.get("https://api.ipify.org", proxies=px, timeout=6)
+            return r.status_code == 200 and len(r.text.strip()) < 20
+        except Exception:
+            return False
+
+    def next(self) -> Optional[str]:
+        with self._lock:
+            if not self.alive:
+                return PROXY_URL.replace("http://", "").replace("https://", "") if PROXY_URL else None
+            p = self.alive[self._i % len(self.alive)]
+            self._i += 1
+            return p
+
+    def drop(self, p: Optional[str]) -> None:
+        if not p:
+            return
+        with self._lock:
+            if p in self.alive:
+                self.alive.remove(p)
+
+    def ensure(self) -> None:
+        if time.time() - self._last_fetch > 600 or len(self.alive) < 3:
+            try:
+                self.fetch()
+            except Exception as e:
+                log(f"proxy fetch: {e}", C.YEL)
+
+
+PROXY_POOL = ProxyPool()
+
 
 
 class C:
@@ -374,15 +483,16 @@ def robust(fn, tries=8, label=""):
                 pass
             log(f"  net {label} HTTP {code} {body!r} ({i+1}/{tries})", C.DIM)
             if code == 429:
-                wait = min(15 * (i + 1) + random.uniform(2, 8), 90)
+                wait = min(12 * (i + 1) + random.uniform(1, 5), 60)
                 _mark_429(wait)
-                time.sleep(wait)
-                delay = min(delay * 2, 40)
+                PROXY_POOL.drop(getattr(getattr(e, "response", None), "_noitu_proxy", None))
+                # rotate proxy + short wait
+                time.sleep(wait * 0.3)
+                delay = min(delay * 1.5, 30)
                 continue
-            if code == 403 and "cloudflare" in body.lower():
-                wait = 12 + random.uniform(1, 5)
-                _mark_429(wait)
-                time.sleep(wait)
+            if code == 403:
+                PROXY_POOL.ensure()
+                time.sleep(2 + random.uniform(0, 2))
                 continue
             if code in (400, 401, 404):
                 break
@@ -713,13 +823,18 @@ def grind_one(acc, wdict):
                 pass
             time.sleep(2)
         ranked_leave(token, code)
-        dash_set(code, status="play", detail="tool.js session", sleep=0)
-        try:
-            res = play_tooljs_session(token, code, wdict, sid)
-            dash_set(code, detail=f"score={res.get('score', 0)}")
-        except Exception as e:
-            dash_set(code, detail=f"play:{type(e).__name__}")
-        time.sleep(0.6)
+        if sid:
+            dash_set(code, status="play", detail=f"rank sid={str(sid)[:8]}", sleep=0)
+            try:
+                res = play_tooljs_session(token, code, wdict, str(sid))
+                dash_set(code, detail=f"score={res.get('score', 0)}")
+            except Exception as e:
+                dash_set(code, detail=f"play:{type(e).__name__}")
+        else:
+            # Solo KHÔNG cộng XP — chỉ rank match mới có. Re-queue.
+            dash_set(code, status="queue", detail="no match → lại queue", sleep=3)
+            time.sleep(3)
+        time.sleep(0.5)
         try:
             level, xp, need = progress(acc, token)
         except Exception:
@@ -990,10 +1105,18 @@ def feature_clear():
 
 def main():
     attach_tty(); banner(); sb_check()
-    log(f"HTTP: {'curl_cffi' if _HAS_CFFI else 'requests'} | proxy={'YES' if PROXY_URL else 'no'} | gap={_RATE_MIN_GAP}s", C.CYN)
+    log(f"HTTP: {'curl_cffi' if _HAS_CFFI else 'requests'} | gap={_RATE_MIN_GAP}s", C.CYN)
+    log("Nạp proxy pool (ProxyScrape)...", C.YEL)
+    try:
+        nprox = PROXY_POOL.fetch(limit_check=35)
+        if nprox == 0:
+            log("Không có proxy sống — thử direct / NOITU_PROXY", C.YEL)
+    except Exception as e:
+        log(f"proxy: {e}", C.YEL)
     if not api_ok_probe():
-        log("API noitu bị CF — thử harvest cookie...", C.YEL)
+        log("API probe fail — harvest CF + refresh proxy", C.YEL)
         harvest_cf_cookies()
+        PROXY_POOL.fetch(limit_check=25)
 
     while True:
         menu()
