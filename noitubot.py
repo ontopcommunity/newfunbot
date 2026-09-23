@@ -10,9 +10,17 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
-    import requests
+    import requests as _requests_fallback
 except ImportError:
-    print("pip install requests"); sys.exit(1)
+    _requests_fallback = None
+try:
+    from curl_cffi import requests as _cffi_requests
+    _HAS_CFFI = True
+except ImportError:
+    _cffi_requests = None
+    _HAS_CFFI = False
+if not _HAS_CFFI and _requests_fallback is None:
+    print("pip install curl_cffi requests"); sys.exit(1)
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:
@@ -21,6 +29,29 @@ try:
     import websocket
 except ImportError:
     websocket = None
+
+# Session dùng curl_cffi (TLS Chrome) — giảm CF fingerprint block / 429
+_cf_cookies: dict = {}
+_http_lock = threading.Lock()
+
+def http_session(impersonate: str = "chrome131"):
+    """HTTP client: ưu tiên curl_cffi impersonate Chrome."""
+    if _HAS_CFFI:
+        s = _cffi_requests.Session(impersonate=impersonate)
+    else:
+        s = _requests_fallback.Session()
+    with _http_lock:
+        if _cf_cookies:
+            s.cookies.update(_cf_cookies)
+    return s
+
+# alias tương thích đoạn code cũ dùng requests.
+class _RequestsProxy:
+    def post(self, *a, **k):
+        return http_session().post(*a, **k)
+    def get(self, *a, **k):
+        return http_session().get(*a, **k)
+requests = _RequestsProxy()  # type: ignore
 
 BASE = "https://api.noitu.fun/api/v1"
 SITE = "https://www.noitu.fun"
@@ -132,6 +163,12 @@ def robust(fn, tries=5, label=""):
             try: body=(e.response.text or "")[:80]
             except Exception: pass
             log(f"  net {label} HTTP {code} {body!r} ({i+1}/{tries})", C.DIM)
+            if code == 429:
+                wait = min(delay * 3, 60)
+                log(f"  429 rate-limit → sleep {wait:.0f}s", C.YEL)
+                time.sleep(wait)
+                delay = min(delay * 2, 30)
+                continue
             if code in (400,401,403,404): break
             time.sleep(delay); delay=min(delay*1.6,15)
         except (requests.exceptions.RequestException, OSError) as e:
@@ -252,6 +289,85 @@ def progress(acc, token):
     level=int(u.get("level",1)); xp=int(u.get("experiencePoints",0)); need=int(u.get("nextLevelRequirement",50))
     acc["level"]=str(level); acc["xp"]=str(xp); upsert_account(acc)
     return level,xp,need
+
+def harvest_cf_cookies(timeout_ms: int = 45000) -> dict:
+    """Playwright mở site, chờ CF challenge (nếu có), lấy cf_clearance → dùng cho API."""
+    global _cf_cookies
+    if sync_playwright is None:
+        log("Playwright chưa cài — bỏ harvest CF", C.YEL)
+        return {}
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=HEADLESS,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                ],
+            )
+            ctx = browser.new_context(
+                viewport={"width": 1366, "height": 768},
+                locale="vi-VN",
+                user_agent=UA,
+                extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8"},
+            )
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "window.chrome={runtime:{}};"
+            )
+            page = ctx.new_page()
+            page.goto(SITE + "/", wait_until="domcontentloaded", timeout=timeout_ms)
+            # chờ challenge hoặc trang load
+            for _ in range(30):
+                title = (page.title() or "").lower()
+                body = ""
+                try:
+                    body = (page.inner_text("body") or "")[:200].lower()
+                except Exception:
+                    pass
+                if "just a moment" in title or "checking" in body:
+                    page.wait_for_timeout(2000)
+                    continue
+                if "attention required" in title or "you have been blocked" in body:
+                    log("CF hard-block IP — cần IP/residential khác", C.RED)
+                    break
+                break
+            cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+            browser.close()
+            useful = {k: v for k, v in cookies.items() if k.startswith("cf_") or k in ("__cf_bm", "cf_clearance")}
+            if useful:
+                with _http_lock:
+                    _cf_cookies.update(useful)
+                log(f"CF cookies: {list(useful.keys())}", C.GRN)
+            else:
+                log("Không lấy được cf_clearance (có thể IP sạch hoặc hard-block)", C.YEL)
+            return useful
+    except Exception as e:
+        log(f"harvest_cf: {e}", C.YEL)
+        return {}
+
+
+def api_ok_probe() -> bool:
+    try:
+        r = http_session().post(
+            f"{BASE}/user/init",
+            json={"id": None, "code": None},
+            headers=_hdr(),
+            timeout=20,
+        )
+        if r.status_code == 200:
+            return True
+        if r.status_code == 429:
+            log("API 429 rate-limit — backoff", C.YEL)
+            time.sleep(8)
+        return False
+    except Exception as e:
+        log(f"API probe: {e}", C.YEL)
+        return False
+
+
 def ranked_join(token, code):
     def _do():
         r=requests.post(f"{BASE}/ranked/queue/join",params={"userCode":code,"game":"WORD_LINK"},headers=_hdr(token),timeout=20)
@@ -480,14 +596,28 @@ def feature_grind():
     except ValueError: n=min(len(need),MAX_PARALLEL)
     n=max(1,min(n,MAX_PARALLEL,len(need)))
     targets=need[:n]
-    mode=safe_input(f"  {C.CYN}1=API rank  2=Playwright{C.R} [1]: ").strip() or "1"
-    use_pw = mode=="2"
-    box("CÀY RANK THẬT", [f"acc={n}", f"mode={'PW' if use_pw else 'API'}", f"skip lv≥{TARGET_LEVEL}"], C.MAG)
+    box("CÀY RANK HYBRID (API + Playwright)", [f"acc={n}", f"skip lv≥{TARGET_LEVEL}", "Tự harvest CF cookie"], C.MAG)
+    # Bypass CF: lấy cookie 1 lần rồi dùng chung API
+    if not api_ok_probe():
+        log("API bị chặn — thử harvest CF qua Playwright...", C.YEL)
+        harvest_cf_cookies()
+        if not api_ok_probe():
+            log("API vẫn chặn. Chuyển Playwright-only (nếu browser vào được).", C.YEL)
     report={}; t0=time.time()
     def worker(a):
-        fn=grind_one_pw if use_pw else grind_one
-        try: report[a["code"]]=fn(a, wdict)
-        except Exception as e: report[a["code"]]={"ok":False,"error":str(e)}
+        try:
+            # Hybrid: API rank+play trước; fail → PW
+            r = grind_one(a, wdict)
+            if not r.get("ok") and not r.get("skipped"):
+                r2 = grind_one_pw(a, wdict)
+                if r2.get("level", 0) >= r.get("level", 0):
+                    r = r2
+            report[a["code"]] = r
+        except Exception as e:
+            try:
+                report[a["code"]] = grind_one_pw(a, wdict)
+            except Exception as e2:
+                report[a["code"]] = {"ok": False, "error": f"{e} | {e2}"}
     with ThreadPoolExecutor(max_workers=n) as pool:
         list(as_completed([pool.submit(worker,a) for a in targets]))
     ok=sum(1 for v in report.values() if v.get("ok"))
@@ -565,6 +695,11 @@ def feature_clear():
 
 def main():
     attach_tty(); banner(); sb_check()
+    log(f"HTTP client: {'curl_cffi Chrome TLS' if _HAS_CFFI else 'requests'}", C.CYN)
+    if not api_ok_probe():
+        log("API noitu bị CF — thử harvest cookie...", C.YEL)
+        harvest_cf_cookies()
+
     while True:
         menu()
         c=safe_input(f"  {C.BOLD}Chọn{C.R} › ").strip(); print()
