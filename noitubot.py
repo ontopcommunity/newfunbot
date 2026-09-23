@@ -41,11 +41,23 @@ _cf_cookies: dict = {}
 _http_lock = threading.Lock()
 
 def http_session(impersonate: str = "chrome131"):
-    """HTTP client: ưu tiên curl_cffi impersonate Chrome."""
+    """HTTP client: curl_cffi Chrome TLS + proxy (nếu có) + CF cookies."""
+    kwargs = {}
+    if PROXY_URL:
+        kwargs["proxies"] = {"http": PROXY_URL, "https": PROXY_URL}
     if _HAS_CFFI:
-        s = _cffi_requests.Session(impersonate=impersonate)
+        try:
+            s = _cffi_requests.Session(impersonate=impersonate, **{k: v for k, v in kwargs.items() if k != "proxies"})
+            if PROXY_URL:
+                s.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+        except TypeError:
+            s = _cffi_requests.Session(impersonate=impersonate)
+            if PROXY_URL:
+                s.proxies = {"http": PROXY_URL, "https": PROXY_URL}
     else:
         s = _requests_lib.Session()
+        if PROXY_URL:
+            s.proxies = {"http": PROXY_URL, "https": PROXY_URL}
     with _http_lock:
         if _cf_cookies:
             try:
@@ -59,13 +71,15 @@ def http_session(impersonate: str = "chrome131"):
     return s
 
 class _RequestsProxy:
-    """Giả requests module: .get/.post + .exceptions (fix robust())."""
+    """Giả requests module: .get/.post + throttle + .exceptions."""
     exceptions = _req_exc
 
     def post(self, *a, **k):
+        _wait_rate()
         return http_session().post(*a, **k)
 
     def get(self, *a, **k):
+        _wait_rate()
         return http_session().get(*a, **k)
 
     def Session(self, *a, **k):
@@ -89,12 +103,44 @@ SUPABASE_URL = "https://tdlubyvugaucfexezhrk.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRkbHVieXZ1Z2F1Y2ZleGV6aHJrIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4Njc4NTcyMSwiZXhwIjoyMTAyMzYxNzIxfQ.7JkJVP9FzC51rZRwdKGL4IdY-m6ZGxyNoRE5WAGt2KU"
 SB_TABLE = "noitu_accounts"
 TARGET_LEVEL = 2
-MAX_PARALLEL = 100
+MAX_PARALLEL = 100  # soft cap; rate-limiter kiểm soát thực tế
 MAX_GAMES = 120
-CHAT_INTERVAL = 0.1
-STALL_BACKOFF = 25
-MATCH_WAIT = 60
+CHAT_INTERVAL = 0.15
+STALL_BACKOFF = 35
+MATCH_WAIT = 45
 HEADLESS = True
+
+# ── Rate limit / 429 shield ──────────────────────────────────
+import os as _os
+PROXY_URL = _os.environ.get("NOITU_PROXY") or _os.environ.get("HTTPS_PROXY") or _os.environ.get("HTTP_PROXY") or ""
+# Giới hạn request/giây toàn process (tránh storm 429)
+_RATE_LOCK = threading.Lock()
+_RATE_LAST = 0.0
+_RATE_MIN_GAP = float(_os.environ.get("NOITU_RATE_GAP", "0.35"))  # giây giữa 2 HTTP call
+_JOIN_SEM = threading.Semaphore(int(_os.environ.get("NOITU_JOIN_CONCURRENCY", "5")))  # max join rank song song
+_429_UNTIL = 0.0  # timestamp: mọi request đợi đến khi qua mốc này
+
+def _wait_rate():
+    """Global throttle + tôn trọng cửa sổ 429."""
+    global _RATE_LAST, _429_UNTIL
+    while True:
+        with _RATE_LOCK:
+            now = time.time()
+            if now < _429_UNTIL:
+                sleep_for = _429_UNTIL - now
+            else:
+                sleep_for = max(0.0, _RATE_MIN_GAP - (now - _RATE_LAST))
+                if sleep_for <= 0:
+                    _RATE_LAST = now
+                    return
+        time.sleep(min(sleep_for, 2.0) + random.uniform(0, 0.15))
+
+def _mark_429(seconds: float = 20.0):
+    global _429_UNTIL
+    with _RATE_LOCK:
+        _429_UNTIL = max(_429_UNTIL, time.time() + seconds)
+    log(f"⚠ 429 → tạm dừng toàn bot ~{seconds:.0f}s", C.YEL)
+
 
 class C:
     R="\033[0m"; BOLD="\033[1m"; DIM="\033[2m"; RED="\033[91m"; GRN="\033[92m"
@@ -173,28 +219,43 @@ def _hdr(token=None):
     if token: h["Authorization"]=f"Bearer {token}"
     return h
 
-def robust(fn, tries=5, label=""):
-    delay=1.2; last=None
+def robust(fn, tries=8, label=""):
+    delay = 1.5
+    last = None
     for i in range(tries):
-        try: return fn()
+        try:
+            return fn()
         except requests.exceptions.HTTPError as e:
-            last=e; code=getattr(getattr(e,"response",None),"status_code","?")
-            body=""
-            try: body=(e.response.text or "")[:80]
-            except Exception: pass
+            last = e
+            code = getattr(getattr(e, "response", None), "status_code", "?")
+            body = ""
+            try:
+                body = (e.response.text or "")[:80]
+            except Exception:
+                pass
             log(f"  net {label} HTTP {code} {body!r} ({i+1}/{tries})", C.DIM)
             if code == 429:
-                wait = min(delay * 3, 60)
-                log(f"  429 rate-limit → sleep {wait:.0f}s", C.YEL)
+                wait = min(15 * (i + 1) + random.uniform(2, 8), 90)
+                _mark_429(wait)
                 time.sleep(wait)
-                delay = min(delay * 2, 30)
+                delay = min(delay * 2, 40)
                 continue
-            if code in (400,401,403,404): break
-            time.sleep(delay); delay=min(delay*1.6,15)
+            if code == 403 and "cloudflare" in body.lower():
+                wait = 12 + random.uniform(1, 5)
+                _mark_429(wait)
+                time.sleep(wait)
+                continue
+            if code in (400, 401, 404):
+                break
+            time.sleep(delay + random.uniform(0, 0.5))
+            delay = min(delay * 1.7, 25)
         except (requests.exceptions.RequestException, OSError) as e:
-            last=e; log(f"  net {label} {type(e).__name__} ({i+1}/{tries})", C.DIM)
-            time.sleep(delay); delay=min(delay*1.6,15)
-    if last: raise last
+            last = e
+            log(f"  net {label} {type(e).__name__} ({i+1}/{tries})", C.DIM)
+            time.sleep(delay + random.uniform(0, 0.8))
+            delay = min(delay * 1.7, 25)
+    if last:
+        raise last
 
 _acc_lock=threading.Lock(); _sb_ok=None
 def _sb_h():
@@ -390,8 +451,16 @@ def api_ok_probe() -> bool:
 
 def ranked_join(token, code):
     def _do():
-        r=requests.post(f"{BASE}/ranked/queue/join",params={"userCode":code,"game":"WORD_LINK"},headers=_hdr(token),timeout=20)
-        r.raise_for_status(); return r.text.strip().strip('"')
+        with _JOIN_SEM:
+            time.sleep(random.uniform(0.2, 0.8))  # jitter chống storm
+            r = requests.post(
+                f"{BASE}/ranked/queue/join",
+                params={"userCode": code, "game": "WORD_LINK"},
+                headers=_hdr(token),
+                timeout=20,
+            )
+            r.raise_for_status()
+            return r.text.strip().strip('"')
     return robust(_do, label="rank/join")
 def ranked_leave(token, code):
     try: requests.post(f"{BASE}/ranked/queue/leave",params={"userCode":code},headers=_hdr(token),timeout=12)
@@ -610,13 +679,20 @@ def feature_grind():
         log(f"Không còn acc cần cày (đã lv≥{TARGET_LEVEL}: {done})", C.YEL); return
     wdict=WordDict()
     if not wdict.words: log("Thiếu dict", C.RED); return
+    suggest = min(len(need), 15)  # mặc định thấp hơn để tránh 429
     print(f"\n  Cần cày {C.GRN}{len(need)}{C.R} | Đã lv{TARGET_LEVEL}: {done} | max {MAX_PARALLEL}")
-    raw=safe_input(f"  {C.CYN}Số acc{C.R} [{min(len(need),MAX_PARALLEL)}]: ").strip()
-    try: n=int(raw) if raw else min(len(need),MAX_PARALLEL)
-    except ValueError: n=min(len(need),MAX_PARALLEL)
+    print(f"  {C.YEL}Gợi ý: ≤15 acc/lần nếu hay bị 429. Proxy: export NOITU_PROXY=http://user:pass@host:port{C.R}")
+    raw=safe_input(f"  {C.CYN}Số acc{C.R} [{suggest}]: ").strip()
+    try: n=int(raw) if raw else suggest
+    except ValueError: n=suggest
     n=max(1,min(n,MAX_PARALLEL,len(need)))
     targets=need[:n]
-    box("CÀY RANK HYBRID (API + Playwright)", [f"acc={n}", f"skip lv≥{TARGET_LEVEL}", "Tự harvest CF cookie"], C.MAG)
+    box("CÀY RANK HYBRID", [
+        f"acc={n}",
+        f"rate gap={_RATE_MIN_GAP}s | join concurrency={_JOIN_SEM._value if hasattr(_JOIN_SEM,'_value') else '?'}",
+        f"proxy={'ON' if PROXY_URL else 'OFF'}",
+        f"skip lv≥{TARGET_LEVEL}",
+    ], C.MAG)
     # Bypass CF: lấy cookie 1 lần rồi dùng chung API
     if not api_ok_probe():
         log("API bị chặn — thử harvest CF qua Playwright...", C.YEL)
@@ -638,8 +714,12 @@ def feature_grind():
                 report[a["code"]] = grind_one_pw(a, wdict)
             except Exception as e2:
                 report[a["code"]] = {"ok": False, "error": f"{e} | {e2}"}
-    with ThreadPoolExecutor(max_workers=n) as pool:
-        list(as_completed([pool.submit(worker,a) for a in targets]))
+    with ThreadPoolExecutor(max_workers=min(n, 20)) as pool:
+        futs = []
+        for i, a in enumerate(targets):
+            futs.append(pool.submit(worker, a))
+            time.sleep(0.4 + random.uniform(0, 0.3))  # stagger start — chống 429
+        list(as_completed(futs))
     ok=sum(1 for v in report.values() if v.get("ok"))
     lines=[f"{time.time()-t0:.0f}s", f"OK lv{TARGET_LEVEL}: {ok}/{n}", ""]
     for c,v in report.items():
@@ -715,7 +795,7 @@ def feature_clear():
 
 def main():
     attach_tty(); banner(); sb_check()
-    log(f"HTTP client: {'curl_cffi Chrome TLS' if _HAS_CFFI else 'requests'}", C.CYN)
+    log(f"HTTP: {'curl_cffi' if _HAS_CFFI else 'requests'} | proxy={'YES' if PROXY_URL else 'no'} | gap={_RATE_MIN_GAP}s", C.CYN)
     if not api_ok_probe():
         log("API noitu bị CF — thử harvest cookie...", C.YEL)
         harvest_cf_cookies()
